@@ -44,6 +44,17 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
   --lr-epochs 1.5 \
   --max-duration 750
 
+  
+export CUDA_VISIBLE_DEVICES="2,3"
+
+./zipformer/train.py \
+  --world-size 2 \
+  --num-epochs 12 \
+  --start-epoch 1 \
+  --exp-dir zipformer/exp \
+  --training-subset L
+  --lr-epochs 1.5 \
+  --max-duration 350
 """
 
 
