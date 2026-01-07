@@ -2,6 +2,7 @@
 
 # fix segmentation fault reported in https://github.com/k2-fsa/icefall/issues/674
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+export CUDA_VISIBLE_DEVICES="4,6,7"
 
 set -eou pipefail
 

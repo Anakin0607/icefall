@@ -1031,7 +1031,7 @@ def run(rank, world_size, args):
 
         return True
 
-    train_cuts = train_cuts.filter(remove_short_and_long_utt)
+    # train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
     valid_dl = wenetspeech.valid_dataloaders(valid_cuts)
 
@@ -1046,15 +1046,15 @@ def run(rank, world_size, args):
         train_cuts, sampler_state_dict=sampler_state_dict
     )
 
-    if not params.print_diagnostics and params.start_batch == 0:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            graph_compiler=graph_compiler,
-            params=params,
-            warmup=0.0 if params.start_epoch == 1 else 1.0,
-        )
+    # if not params.print_diagnostics and params.start_batch == 0:
+    #     scan_pessimistic_batches_for_oom(
+    #         model=model,
+    #         train_dl=train_dl,
+    #         optimizer=optimizer,
+    #         graph_compiler=graph_compiler,
+    #         params=params,
+    #         warmup=0.0 if params.start_epoch == 1 else 1.0,
+    #     )
 
     scaler = GradScaler(enabled=params.use_fp16)
     if checkpoints and "grad_scaler" in checkpoints:

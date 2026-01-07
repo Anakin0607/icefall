@@ -1544,26 +1544,30 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5), (4000.0, 0.0)),
     ) -> None:
         super().__init__()
+
+        # 载入输入参数
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.query_head_dim = query_head_dim
         self.pos_head_dim = pos_head_dim
         self.dropout = dropout
-        self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate)
+        self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate) # deepcopy保证复制对象和原始对象完全独立
         self.name = None  # will be overwritten in training code; for diagnostics.
 
+        # q和k维度相同
         key_head_dim = query_head_dim
-        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads
+        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads #总的变换维度
 
         # the initial_scale is supposed to take over the "scaling" factor of
         # head_dim ** -0.5 that has been used in previous forms of attention,
         # dividing it between the query and key.   Note: this module is intended
         # to be used with the ScaledAdam optimizer; with most other optimizers,
         # it would be necessary to apply the scaling factor in the forward function.
-        self.in_proj = ScaledLinear(
+        self.in_proj = ScaledLinear( # 创建一个全连接层，用于将输入x变换至q，k，v，但这里仅计算权重，没有V，但是需要一个位置编码P
             embed_dim, in_proj_dim, bias=True, initial_scale=query_head_dim**-0.25
         )
 
+        # 白化特征，去除相关性
         self.whiten_keys = Whiten(
             num_groups=num_heads,
             whitening_limit=_whitening_schedule(3.0),
@@ -1595,6 +1599,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         )
 
         # the following are for diagnostics only, see --print-diagnostics option
+        # 用于调试，这两层为恒等映射层，可以通过hook挂载来查看这两层的数值
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
 
@@ -1618,7 +1623,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
            a tensor of attention weights, of shape (hum_heads, batch_size, seq_len, seq_len)
            interpreted as (hum_heads, batch_size, tgt_seq_len, src_seq_len).
         """
-        x = self.in_proj(x)
+        x = self.in_proj(x) # 变换输入X得到Q,K和P
         query_head_dim = self.query_head_dim
         pos_head_dim = self.pos_head_dim
         num_heads = self.num_heads
@@ -1632,7 +1637,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = x[..., query_dim : 2 * query_dim]
         # p is the position-encoding query
         p = x[..., 2 * query_dim :]
-        assert p.shape[-1] == num_heads * pos_head_dim, (
+        assert p.shape[-1] == num_heads * pos_head_dim, ( # 确认P的维度正确，因为p是qk切分完剩下的部分
             p.shape[-1],
             num_heads,
             pos_head_dim,
@@ -1642,27 +1647,30 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = self.whiten_keys(self.balance_keys(k))  # does nothing in the forward pass.
         p = self.copy_pos_query(p)  # for diagnostics only, does nothing.
 
+        # reshape 供后面矩阵相乘
         q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
         p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
         k = k.reshape(seq_len, batch_size, num_heads, query_head_dim)
 
+        # 调整维度顺序，同时转置K
         # time1 refers to target, time2 refers to source.
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
         p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
         k = k.permute(2, 1, 3, 0)  # (head, batch, d_k, time2)
 
-        attn_scores = torch.matmul(q, k)
+        attn_scores = torch.matmul(q, k) # 得到attention权重
 
         use_pos_scores = False
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
+        if torch.jit.is_scripting() or torch.jit.is_tracing(): # 如果是导出或推理模式，强制使用位置编码
             # We can't put random.random() in the same line
             use_pos_scores = True
-        elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
+        elif not self.training or random.random() >= float(self.pos_emb_skip_rate): 
+            # 如果是训练则生成一个随机数，大于pos_skip_rate则使用位置编码，防止过度依赖位置信息，是一种正则化方法
             use_pos_scores = True
 
-        if use_pos_scores:
-            pos_emb = self.linear_pos(pos_emb)
-            seq_len2 = 2 * seq_len - 1
+        if use_pos_scores: # 如果使用位置编码
+            pos_emb = self.linear_pos(pos_emb) # 将输入的嵌入位置编码投影至P矩阵，然后进行维度调整
+            seq_len2 = 2 * seq_len - 1 # 若输入序列长度为n，则相对位置编码的序列长度为为2n-1
             pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(
                 2, 0, 3, 1
             )
@@ -1670,11 +1678,11 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
             # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
             #  [where seq_len2 represents relative position.]
-            pos_scores = torch.matmul(p, pos_emb)
+            pos_scores = torch.matmul(p, pos_emb) # 得到每个时间步S对所有相对距离为2S-1的相对分数
             # the following .as_strided() expression converts the last axis of pos_scores from relative
             # to absolute position.  I don't know whether I might have got the time-offsets backwards or
             # not, but let this code define which way round it is supposed to be.
-            if torch.jit.is_tracing():
+            if torch.jit.is_tracing(): # 导出
                 (num_heads, batch_size, time1, n) = pos_scores.shape
                 rows = torch.arange(start=time1 - 1, end=-1, step=-1)
                 cols = torch.arange(seq_len)
@@ -1683,8 +1691,8 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
                 pos_scores = pos_scores.reshape(-1, n)
                 pos_scores = torch.gather(pos_scores, dim=1, index=indexes)
                 pos_scores = pos_scores.reshape(num_heads, batch_size, time1, seq_len)
-            else:
-                pos_scores = pos_scores.as_strided(
+            else: 
+                pos_scores = pos_scores.as_strided( # 进行相对位置变换，以便和attn_scores相加
                     (num_heads, batch_size, seq_len, seq_len),
                     (
                         pos_scores.stride(0),
