@@ -12,4 +12,4 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
     --encoder-dim 320 \
     --max-duration 300 \
     --master-port 12300 \
-    --start-batch 120000
+    --start-batch 432000

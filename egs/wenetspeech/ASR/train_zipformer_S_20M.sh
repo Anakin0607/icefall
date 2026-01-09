@@ -14,4 +14,4 @@ export CUDA_VISIBLE_DEVICES="4,6"
   --num-heads "4,4,4,4,4" \
   --cnn-module-kernel "31,31,15,31,31" \
   --lr-epochs 1.5 \
-  --max-duration 500
+  --max-duration 900
