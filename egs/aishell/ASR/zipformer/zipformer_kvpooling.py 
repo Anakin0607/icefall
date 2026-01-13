@@ -1828,6 +1828,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         num_heads = self.num_heads
 
         seq_len, batch_size, _ = x.shape
+
         query_dim = query_head_dim * num_heads
 
         # self-attention
@@ -2142,17 +2143,12 @@ class RelPositionMultiheadAttentionWeights_avgpool(nn.Module):
         seq_len, batch_size, _ = x.shape
         query_dim = query_head_dim * num_heads
 
-        # 切分 Q, K, P
+        # 1. 切分 Q, K, P
         q = x[..., 0:query_dim]
         k = x[..., query_dim : 2 * query_dim]
         p = x[..., 2 * query_dim :]
-        assert p.shape[-1] == num_heads * pos_head_dim, ( # 确认P的维度正确，因为p是qk切分完剩下的部分
-            p.shape[-1],
-            num_heads,
-            pos_head_dim,
-        ) # 确认p的维度正确
 
-        # 对 K 进行 AvgPool 下采样
+        # 2. 对 K 进行 AvgPool 下采样
         if self.pooling_stride > 1:
             # k shape: [seq_len, batch, dim] -> [batch, dim, seq_len]
             k = k.permute(1, 2, 0)
@@ -2182,10 +2178,10 @@ class RelPositionMultiheadAttentionWeights_avgpool(nn.Module):
         p = p.permute(2, 1, 0, 3)
         k = k.permute(2, 1, 3, 0)
 
-        # QK^T
+        # 3. 计算 QK^T
         attn_scores = torch.matmul(q, k)
 
-        # 相对位置编码处理 (逻辑保持一致，复用之前的 Gather 逻辑)
+        # 4. 相对位置编码处理 (逻辑保持一致，复用之前的 Gather 逻辑)
         use_pos_scores = False
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             use_pos_scores = True
@@ -2193,57 +2189,22 @@ class RelPositionMultiheadAttentionWeights_avgpool(nn.Module):
             use_pos_scores = True
 
         if use_pos_scores:
-            pos_emb = self.linear_pos(pos_emb)
-            seq_len2 = 2 * seq_len - 1 # 若输入序列长度为n，则相对位置编码的序列长度为为2n-1
-            pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(
-                2, 0, 3, 1
-            )
-            # pos shape now: (head, {1 or batch_size}, pos_dim, seq_len2)
-
-            # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
-            #  [where seq_len2 represents relative position.]
-            pos_scores = torch.matmul(p, pos_emb) # 得到每个时间步S对所有相对距离为2S-1的相对分数
-            # the following .as_strided() expression converts the last axis of pos_scores from relative
-            # to absolute position.  I don't know whether I might have got the time-offsets backwards or
-            # not, but let this code define which way round it is supposed to be
+            pos_emb_proj = self.linear_pos(pos_emb)
+            pos_emb_proj = pos_emb_proj.view(1, -1, num_heads, pos_head_dim).permute(2, 0, 3, 1)
+            raw_pos_scores = torch.matmul(p, pos_emb_proj)
             
-            # 因为pos_dim通常远小于key_head_dim，即pos_dim和key_head_dim被pooling后维度差不多
-            # 位置编码本身计算复杂度就小于QK^T，故不用担心位置编码不做降采样会拖慢计算速度
-
-            # todo: 修改坐标偏移，得到最终结果
+            center_offset = pos_emb.shape[1] // 2 
+            idx_q = torch.arange(seq_len, device=q.device).unsqueeze(1)
+            idx_k = torch.arange(k_len, device=q.device).unsqueeze(0) * self.pooling_stride
+            rel_pos = idx_k - idx_q + center_offset
+            rel_pos = rel_pos.clamp(min=0, max=raw_pos_scores.shape[-1] - 1)
+            
+            gather_idx = rel_pos.unsqueeze(0).unsqueeze(0).expand(num_heads, batch_size, -1, -1)
+            pos_scores = torch.gather(raw_pos_scores, dim=-1, index=gather_idx)
 
             attn_scores = attn_scores + pos_scores
 
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            pass
-        elif self.training and random.random() < 0.1:
-            # This is a harder way of limiting the attention scores to not be
-            # too large.  It incurs a penalty if any of them has an absolute
-            # value greater than 50.0.  this should be outside the normal range
-            # of the attention scores.  We use this mechanism instead of, say,
-            # something added to the loss function involving the entropy,
-            # because once the entropy gets very small gradients through the
-            # softmax can become very small, and we'd get zero derivatives.  The
-            # choices of 1.0e-04 as the scale on the penalty makes this
-            # mechanism vulnerable to the absolute scale of the loss function,
-            # but we view this as a failsafe to avoid "implausible" parameter
-            # values rather than a regularization method that should be active
-            # under normal circumstances.
-            attn_scores = penalize_abs_values_gt(
-                attn_scores, limit=25.0, penalty=1.0e-04, name=self.name
-            )
-
-        assert attn_scores.shape == (num_heads, batch_size, seq_len, seq_len)
-
-        # Mask 处理
-        if attn_mask is not None:
-            assert attn_mask.dtype == torch.bool
-            # use -1000 to avoid nan's where attn_mask and key_padding_mask make
-            # all scores zero.  It's important that this be large enough that exp(-1000)
-            # is exactly zero, for reasons related to const_attention_rate, it
-            # compares the final weights with zero.
-            attn_scores = attn_scores.masked_fill(attn_mask, -1000)
-            
+        # 5. Mask 处理
         if key_padding_mask is not None:
             if self.pooling_stride > 1:
                 # 简单切片，与 AvgPool 的非重叠窗口对应
@@ -2253,7 +2214,7 @@ class RelPositionMultiheadAttentionWeights_avgpool(nn.Module):
                 key_padding_mask = mask_strided
                 
             attn_scores = attn_scores.masked_fill(
-                key_padding_mask.unsqueeze(1),
+                key_padding_mask.unsqueeze(1).unsqueeze(2),
                 -1000,
             )
 

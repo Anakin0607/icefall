@@ -1,13 +1,12 @@
 # KV-pooling zipformer M scale, is S scale to original zipformer papaer
-# max-duration is audio length in one batch
-export CUDA_VISIBLE_DEVICES="6,7"
 
-./zipformer/train.py \
+export CUDA_VISIBLE_DEVICES="2,3"
+
+./zipformer/train_kvpooling.py \
   --world-size 2 \
-  --num-epochs 20 \
+  --num-epochs 12 \
   --start-epoch 1 \
-  --exp-dir zipformer/exp-M-40M-bpe5000 \
-  --bpe-model data/lang_bpe_5000/bpe.model \
+  --exp-dir zipformer/exp-M-40M-avgpooling \
   --use-fp16 1 \
   --num-encoder-layers  2,2,3,3,2 \
   --feedforward-dim 512,768,1024,1024,768  \
@@ -16,6 +15,7 @@ export CUDA_VISIBLE_DEVICES="6,7"
   --downsampling-factor "1,2,4,4,2"  \
   --num-heads "4,4,4,4,4"  \
   --cnn-module-kernel "31,31,15,15,31"  \
+  --pooling-mode "conv" \
+  --pooling-stride "4,2,1,1,2" \
   --lr-epochs 1.5 \
-  --max-duration 900 \
-  --master-port 12355
+  --max-duration 300 # total audio length in one batch

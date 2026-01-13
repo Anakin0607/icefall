@@ -3,8 +3,9 @@ export CUDA_VISIBLE_DEVICES="4"
 ./zipformer/train.py \
   --world-size 1 \
   --num-epochs 20 \
-  --start-epoch 9 \
-  --exp-dir zipformer/exp-S-20M \
+  --start-epoch 1 \
+  --exp-dir zipformer/exp-S-20M-bpe5000 \
+  --bpe-model data/lang_bpe_5000/bpe.model \
   --use-fp16 1 \
   --num-encoder-layers "2,2,3,2,2" \
   --downsampling-factor "1,2,4,2,1" \
