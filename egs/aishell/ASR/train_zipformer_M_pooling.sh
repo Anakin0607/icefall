@@ -1,12 +1,12 @@
 # KV-pooling zipformer M scale, is S scale to original zipformer papaer
 
-export CUDA_VISIBLE_DEVICES="2,3"
+export CUDA_VISIBLE_DEVICES="6,7"
 
 ./zipformer/train_kvpooling.py \
   --world-size 2 \
-  --num-epochs 12 \
-  --start-epoch 1 \
-  --exp-dir zipformer/exp-M-40M-avgpooling \
+  --num-epochs 20 \
+  --start-epoch 5 \
+  --exp-dir zipformer/exp-M-40M-convpooling \
   --use-fp16 1 \
   --num-encoder-layers  2,2,3,3,2 \
   --feedforward-dim 512,768,1024,1024,768  \
@@ -18,4 +18,5 @@ export CUDA_VISIBLE_DEVICES="2,3"
   --pooling-mode "conv" \
   --pooling-stride "4,2,1,1,2" \
   --lr-epochs 1.5 \
-  --max-duration 300 # total audio length in one batch
+  --master-port 12356 \
+  --max-duration 500 # total audio length in one batch

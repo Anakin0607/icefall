@@ -22,7 +22,6 @@ import math
 import random
 import warnings
 from typing import List, Optional, Tuple, Union
-import torch.nn.functional as F
 
 import torch
 from encoder_interface import EncoderInterface
@@ -119,8 +118,6 @@ class Zipformer2(EncoderInterface):
         causal: bool = False,
         chunk_size: Tuple[int] = [-1],
         left_context_frames: Tuple[int] = [-1],
-        pooling_mode: str = "none",
-        pooling_stride: Union[int, Tuple[int]] = 1,
     ) -> None:
         super(Zipformer2, self).__init__()
 
@@ -157,8 +154,6 @@ class Zipformer2(EncoderInterface):
         self.chunk_size = chunk_size
         self.left_context_frames = left_context_frames
 
-        pooling_stride = _to_tuple(pooling_stride)
-
         for u, d in zip(encoder_unmasked_dim, encoder_dim):
             assert u <= d
 
@@ -178,8 +173,6 @@ class Zipformer2(EncoderInterface):
                 dropout=dropout,
                 cnn_module_kernel=cnn_module_kernel[i],
                 causal=causal,
-                pooling_mode=pooling_mode,
-                pooling_stride = pooling_stride[i],
             )
 
             # For the segment of the warmup period, we let the Conv2dSubsampling
@@ -564,8 +557,6 @@ class Zipformer2EncoderLayer(nn.Module):
         feedforward_dim: the dimension of the feedforward network model (required).
         dropout: the dropout value (default=0.1).
         cnn_module_kernel (int): Kernel size of convolution module (default=31).
-        pooling_mode: support "conv" or "avg" to use conv or avarage pooling kernel to pooling k and v in attention
-        pooling_stride: stride of pooling
 
     Examples::
         >>> encoder_layer = Zipformer2EncoderLayer(embed_dim=512, nhead=8)
@@ -585,8 +576,6 @@ class Zipformer2EncoderLayer(nn.Module):
         feedforward_dim: int,
         dropout: FloatLike = 0.1,
         cnn_module_kernel: int = 31,
-        pooling_mode: str = "none",
-        pooling_stride: int = 1,
         causal: bool = False,
         attention_skip_rate: FloatLike = ScheduledFloat(
             (0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0
@@ -630,45 +619,18 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self.const_attention_rate = copy.deepcopy(const_attention_rate)
 
-        if pooling_mode == "conv":
-            self.self_attn_weights = RelPositionMultiheadAttentionWeights_convpool(
-                embed_dim,
-                pos_dim=pos_dim,
-                num_heads=num_heads,
-                query_head_dim=query_head_dim,
-                pos_head_dim=pos_head_dim,
-                dropout=0.0,
-                pooling_stride=pooling_stride,
-            )
-        elif pooling_mode == "avg":
-            self.self_attn_weights = RelPositionMultiheadAttentionWeights_avgpool(
-                embed_dim,
-                pos_dim=pos_dim,
-                num_heads=num_heads,
-                query_head_dim=query_head_dim,
-                pos_head_dim=pos_head_dim,
-                dropout=0.0,
-                pooling_stride=pooling_stride,
-            )
-        else:
-            self.self_attn_weights = RelPositionMultiheadAttentionWeights(
-                embed_dim,
-                pos_dim=pos_dim,
-                num_heads=num_heads,
-                query_head_dim=query_head_dim,
-                pos_head_dim=pos_head_dim,
-                dropout=0.0,
-            )
+        self.self_attn_weights = RelPositionMultiheadAttentionWeights(
+            embed_dim,
+            pos_dim=pos_dim,
+            num_heads=num_heads,
+            query_head_dim=query_head_dim,
+            pos_head_dim=pos_head_dim,
+            dropout=0.0,
+        )
 
-        if pooling_mode == "conv":
-            self.self_attn1 = SelfAttention_convpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-            self.self_attn2 = SelfAttention_convpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-        elif pooling_mode == "avg":
-            self.self_attn1 = SelfAttention_avgpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-            self.self_attn2 = SelfAttention_avgpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-        else:
-            self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim)
-            self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim)
+        self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim)
+
+        self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim)
 
         self.feed_forward1 = FeedforwardModule(
             embed_dim, (feedforward_dim * 3) // 4, dropout
@@ -1582,30 +1544,26 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5), (4000.0, 0.0)),
     ) -> None:
         super().__init__()
-
-        # 载入输入参数
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.query_head_dim = query_head_dim
         self.pos_head_dim = pos_head_dim
         self.dropout = dropout
-        self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate) # deepcopy保证复制对象和原始对象完全独立
+        self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate)
         self.name = None  # will be overwritten in training code; for diagnostics.
 
-        # q和k维度相同
         key_head_dim = query_head_dim
-        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads #总的变换维度
+        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads
 
         # the initial_scale is supposed to take over the "scaling" factor of
         # head_dim ** -0.5 that has been used in previous forms of attention,
         # dividing it between the query and key.   Note: this module is intended
         # to be used with the ScaledAdam optimizer; with most other optimizers,
         # it would be necessary to apply the scaling factor in the forward function.
-        self.in_proj = ScaledLinear( # 创建一个全连接层，用于将输入x变换至q，k，v，但这里仅计算权重，没有V，但是需要一个位置编码P
+        self.in_proj = ScaledLinear(
             embed_dim, in_proj_dim, bias=True, initial_scale=query_head_dim**-0.25
         )
 
-        # 白化特征，去除相关性
         self.whiten_keys = Whiten(
             num_groups=num_heads,
             whitening_limit=_whitening_schedule(3.0),
@@ -1637,7 +1595,6 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         )
 
         # the following are for diagnostics only, see --print-diagnostics option
-        # 用于调试，这两层为恒等映射层，可以通过hook挂载来查看这两层的数值
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
 
@@ -1661,7 +1618,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
            a tensor of attention weights, of shape (hum_heads, batch_size, seq_len, seq_len)
            interpreted as (hum_heads, batch_size, tgt_seq_len, src_seq_len).
         """
-        x = self.in_proj(x) # 变换输入X得到Q,K和P
+        x = self.in_proj(x)
         query_head_dim = self.query_head_dim
         pos_head_dim = self.pos_head_dim
         num_heads = self.num_heads
@@ -1675,7 +1632,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = x[..., query_dim : 2 * query_dim]
         # p is the position-encoding query
         p = x[..., 2 * query_dim :]
-        assert p.shape[-1] == num_heads * pos_head_dim, ( # 确认P的维度正确，因为p是qk切分完剩下的部分
+        assert p.shape[-1] == num_heads * pos_head_dim, (
             p.shape[-1],
             num_heads,
             pos_head_dim,
@@ -1685,30 +1642,27 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = self.whiten_keys(self.balance_keys(k))  # does nothing in the forward pass.
         p = self.copy_pos_query(p)  # for diagnostics only, does nothing.
 
-        # reshape 供后面矩阵相乘
         q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
         p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
         k = k.reshape(seq_len, batch_size, num_heads, query_head_dim)
 
-        # 调整维度顺序，同时转置K
         # time1 refers to target, time2 refers to source.
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
         p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
         k = k.permute(2, 1, 3, 0)  # (head, batch, d_k, time2)
 
-        attn_scores = torch.matmul(q, k) # 得到attention权重
+        attn_scores = torch.matmul(q, k)
 
         use_pos_scores = False
-        if torch.jit.is_scripting() or torch.jit.is_tracing(): # 如果是导出或推理模式，强制使用位置编码
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
             # We can't put random.random() in the same line
             use_pos_scores = True
-        elif not self.training or random.random() >= float(self.pos_emb_skip_rate): 
-            # 如果是训练则生成一个随机数，大于pos_skip_rate则使用位置编码，防止过度依赖位置信息，是一种正则化方法
+        elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
             use_pos_scores = True
 
-        if use_pos_scores: # 如果使用位置编码
-            pos_emb = self.linear_pos(pos_emb) # 将输入的嵌入位置编码投影至P矩阵，然后进行维度调整
-            seq_len2 = 2 * seq_len - 1 # 若输入序列长度为n，则相对位置编码的序列长度为为2n-1
+        if use_pos_scores:
+            pos_emb = self.linear_pos(pos_emb)
+            seq_len2 = 2 * seq_len - 1
             pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(
                 2, 0, 3, 1
             )
@@ -1716,11 +1670,11 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
             # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
             #  [where seq_len2 represents relative position.]
-            pos_scores = torch.matmul(p, pos_emb) # 得到每个时间步S对所有相对距离为2S-1的相对分数
+            pos_scores = torch.matmul(p, pos_emb)
             # the following .as_strided() expression converts the last axis of pos_scores from relative
             # to absolute position.  I don't know whether I might have got the time-offsets backwards or
             # not, but let this code define which way round it is supposed to be.
-            if torch.jit.is_tracing(): # 导出
+            if torch.jit.is_tracing():
                 (num_heads, batch_size, time1, n) = pos_scores.shape
                 rows = torch.arange(start=time1 - 1, end=-1, step=-1)
                 cols = torch.arange(seq_len)
@@ -1729,8 +1683,8 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
                 pos_scores = pos_scores.reshape(-1, n)
                 pos_scores = torch.gather(pos_scores, dim=1, index=indexes)
                 pos_scores = pos_scores.reshape(num_heads, batch_size, time1, seq_len)
-            else: 
-                pos_scores = pos_scores.as_strided( # 进行相对位置变换，以便和attn_scores相加
+            else:
+                pos_scores = pos_scores.as_strided(
                     (num_heads, batch_size, seq_len, seq_len),
                     (
                         pos_scores.stride(0),
@@ -1828,6 +1782,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         num_heads = self.num_heads
 
         seq_len, batch_size, _ = x.shape
+
         query_dim = query_head_dim * num_heads
 
         # self-attention
@@ -2058,608 +2013,7 @@ class SelfAttention(nn.Module):
 
         return x, cached_val
 
-class RelPositionMultiheadAttentionWeights_avgpool(nn.Module):
-    """
-    [AvgPool 版本] 支持 KV-Pooling 的相对位置多头注意力权重计算模块。
-    """
 
-    def __init__(
-        self,
-        embed_dim: int,
-        pos_dim: int,
-        num_heads: int,
-        query_head_dim: int,
-        pos_head_dim: int,
-        dropout: float = 0.0,
-        pos_emb_skip_rate: float = 0.0,
-        pooling_stride: int = 1, # 下采样倍率
-    ) -> None:
-        super().__init__()
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.query_head_dim = query_head_dim
-        self.pos_head_dim = pos_head_dim
-        self.dropout = dropout
-        self.pos_emb_skip_rate = pos_emb_skip_rate
-        self.pooling_stride = pooling_stride
-        self.name = None
-
-        key_head_dim = query_head_dim
-        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads
-
-        self.in_proj = ScaledLinear(
-            embed_dim, in_proj_dim, bias=True, initial_scale=query_head_dim**-0.25
-        )
-
-        # [修改点] 使用 AvgPool1d 代替 Conv1d
-        if self.pooling_stride > 1:
-            # kernel_size=stride, stride=stride 实现了非重叠的平均池化
-            self.k_pool = nn.AvgPool1d(
-                kernel_size=pooling_stride,
-                stride=pooling_stride,
-                padding=0,     # 我们会手动 padding 保证对齐
-                ceil_mode=False 
-            )
-        
-        # ... (其余部分保持不变) ...
-        self.whiten_keys = Whiten(
-            num_groups=num_heads,
-            whitening_limit=_whitening_schedule(3.0),
-            prob=(0.025, 0.25),
-            grad_scale=0.025,
-        )
-
-        self.balance_keys = Balancer(
-            key_head_dim * num_heads,
-            channel_dim=-1,
-            min_positive=0.4,
-            max_positive=0.6,
-            min_abs=0.0,
-            max_abs=100.0,
-            prob=0.025,
-        )
-
-        self.linear_pos = ScaledLinear(
-            pos_dim, num_heads * pos_head_dim, bias=False, initial_scale=0.05
-        )
-
-        self.copy_pos_query = Identity()
-        self.copy_query = Identity()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos_emb: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        x = self.in_proj(x)
-        query_head_dim = self.query_head_dim
-        pos_head_dim = self.pos_head_dim
-        num_heads = self.num_heads
-
-        seq_len, batch_size, _ = x.shape
-        query_dim = query_head_dim * num_heads
-
-        # 切分 Q, K, P
-        q = x[..., 0:query_dim]
-        k = x[..., query_dim : 2 * query_dim]
-        p = x[..., 2 * query_dim :]
-        assert p.shape[-1] == num_heads * pos_head_dim, ( # 确认P的维度正确，因为p是qk切分完剩下的部分
-            p.shape[-1],
-            num_heads,
-            pos_head_dim,
-        ) # 确认p的维度正确
-
-        # 对 K 进行 AvgPool 下采样
-        if self.pooling_stride > 1:
-            # k shape: [seq_len, batch, dim] -> [batch, dim, seq_len]
-            k = k.permute(1, 2, 0)
-            
-            # 手动 Padding 确保能整除，这对 AvgPool 很重要，否则最后的一点数据会被丢弃
-            if k.size(2) % self.pooling_stride != 0:
-                pad_len = self.pooling_stride - (k.size(2) % self.pooling_stride)
-                # pad 最后一个维度 (seq_len)
-                k = F.pad(k, (0, pad_len))
-            
-            k = self.k_pool(k) # -> [batch, dim, seq_len/stride]
-            k = k.permute(2, 0, 1) # -> [seq_len/stride, batch, dim]
-
-        k_len = k.shape[0]
-
-        q = self.copy_query(q)
-        k = self.whiten_keys(self.balance_keys(k))
-        p = self.copy_pos_query(p)
-
-        # Reshape
-        q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
-        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
-        k = k.reshape(k_len, batch_size, num_heads, query_head_dim)
-
-        # Permute
-        q = q.permute(2, 1, 0, 3)
-        p = p.permute(2, 1, 0, 3)
-        k = k.permute(2, 1, 3, 0)
-
-        # QK^T
-        attn_scores = torch.matmul(q, k)
-
-        # 相对位置编码处理 (逻辑保持一致，复用之前的 Gather 逻辑)
-        use_pos_scores = False
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            use_pos_scores = True
-        elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
-            use_pos_scores = True
-
-        if use_pos_scores:
-            pos_emb = self.linear_pos(pos_emb)
-            seq_len2 = 2 * seq_len - 1 # 若输入序列长度为n，则相对位置编码的序列长度为为2n-1
-            pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(
-                2, 0, 3, 1
-            )
-            # pos shape now: (head, {1 or batch_size}, pos_dim, seq_len2)
-
-            # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
-            #  [where seq_len2 represents relative position.]
-            pos_scores = torch.matmul(p, pos_emb) # 得到每个时间步S对所有相对距离为2S-1的相对分数
-            # the following .as_strided() expression converts the last axis of pos_scores from relative
-            # to absolute position.  I don't know whether I might have got the time-offsets backwards or
-            # not, but let this code define which way round it is supposed to be
-            
-            # 因为pos_dim通常远小于key_head_dim，即pos_dim和key_head_dim被pooling后维度差不多
-            # 位置编码本身计算复杂度就小于QK^T，故不用担心位置编码不做降采样会拖慢计算速度
-
-            # todo: 修改坐标偏移，得到最终结果
-
-            attn_scores = attn_scores + pos_scores
-
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            pass
-        elif self.training and random.random() < 0.1:
-            # This is a harder way of limiting the attention scores to not be
-            # too large.  It incurs a penalty if any of them has an absolute
-            # value greater than 50.0.  this should be outside the normal range
-            # of the attention scores.  We use this mechanism instead of, say,
-            # something added to the loss function involving the entropy,
-            # because once the entropy gets very small gradients through the
-            # softmax can become very small, and we'd get zero derivatives.  The
-            # choices of 1.0e-04 as the scale on the penalty makes this
-            # mechanism vulnerable to the absolute scale of the loss function,
-            # but we view this as a failsafe to avoid "implausible" parameter
-            # values rather than a regularization method that should be active
-            # under normal circumstances.
-            attn_scores = penalize_abs_values_gt(
-                attn_scores, limit=25.0, penalty=1.0e-04, name=self.name
-            )
-
-        assert attn_scores.shape == (num_heads, batch_size, seq_len, seq_len)
-
-        # Mask 处理
-        if attn_mask is not None:
-            assert attn_mask.dtype == torch.bool
-            # use -1000 to avoid nan's where attn_mask and key_padding_mask make
-            # all scores zero.  It's important that this be large enough that exp(-1000)
-            # is exactly zero, for reasons related to const_attention_rate, it
-            # compares the final weights with zero.
-            attn_scores = attn_scores.masked_fill(attn_mask, -1000)
-            
-        if key_padding_mask is not None:
-            if self.pooling_stride > 1:
-                # 简单切片，与 AvgPool 的非重叠窗口对应
-                mask_strided = key_padding_mask[:, ::self.pooling_stride]
-                if mask_strided.shape[1] > k_len:
-                    mask_strided = mask_strided[:, :k_len]
-                key_padding_mask = mask_strided
-                
-            attn_scores = attn_scores.masked_fill(
-                key_padding_mask.unsqueeze(1),
-                -1000,
-            )
-
-        attn_weights = softmax(attn_scores, dim=-1)
-        
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.dropout, training=self.training
-        )
-
-        return attn_weights
-
-class SelfAttention_avgpool(nn.Module):
-    """
-    [AvgPool 版本] 支持 KV-Pooling 的 SelfAttention 模块。
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        value_head_dim: int,
-        pooling_stride: int = 1,
-    ) -> None:
-        super().__init__()
-        self.in_proj = nn.Linear(embed_dim, num_heads * value_head_dim, bias=True)
-        self.pooling_stride = pooling_stride
-        
-        self.out_proj = ScaledLinear(
-            num_heads * value_head_dim, embed_dim, bias=True, initial_scale=0.05
-        )
-        self.value_head_dim = value_head_dim
-
-        # [修改点] 使用 AvgPool1d
-        if self.pooling_stride > 1:
-            self.v_pool = nn.AvgPool1d(
-                kernel_size=pooling_stride,
-                stride=pooling_stride,
-                padding=0,
-                ceil_mode=False
-            )
-
-        self.whiten = Whiten(
-            num_groups=1,
-            whitening_limit=_whitening_schedule(7.5, ratio=3.0),
-            prob=(0.025, 0.25),
-            grad_scale=0.01,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        (seq_len, batch_size, embed_dim) = x.shape
-        num_heads = attn_weights.shape[0]
-        
-        x = self.in_proj(x)
-        
-        # 对 V 进行 AvgPool
-        if self.pooling_stride > 1:
-            x = x.permute(1, 2, 0)
-            if x.size(2) % self.pooling_stride != 0:
-                pad_len = self.pooling_stride - (x.size(2) % self.pooling_stride)
-                x = F.pad(x, (0, pad_len))
-            
-            x = self.v_pool(x) # -> [batch, dim, seq_len/stride]
-            x = x.permute(2, 0, 1)
-
-        x = x.reshape(-1, batch_size, num_heads, self.value_head_dim).permute(2, 1, 0, 3)
-        # x (V): (num_heads, batch_size, k_len, value_head_dim)
-        
-        assert attn_weights.shape[-1] == x.shape[-2]
-
-        x = torch.matmul(attn_weights, x)
-
-        x = (
-            x.permute(2, 1, 0, 3)
-            .contiguous()
-            .view(seq_len, batch_size, -1)
-        )
-
-        x = self.out_proj(x)
-        x = self.whiten(x)
-
-        return x
-
-class RelPositionMultiheadAttentionWeights_convpool(nn.Module):
-    """
-    支持 KV-Pooling (Strided) 的相对位置多头注意力权重计算模块。
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        pos_dim: int,
-        num_heads: int,
-        query_head_dim: int,
-        pos_head_dim: int,
-        dropout: float = 0.0,
-        pos_emb_skip_rate: float = 0.0, # 简化类型提示以便阅读
-        pooling_stride: int = 1, # [新增] 下采样倍率，默认为1即不降采样
-    ) -> None:
-        super().__init__()
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.query_head_dim = query_head_dim
-        self.pos_head_dim = pos_head_dim
-        self.dropout = dropout
-        self.pos_emb_skip_rate = pos_emb_skip_rate
-        self.pooling_stride = pooling_stride # [新增]
-        self.name = None
-
-        key_head_dim = query_head_dim
-        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads
-
-        self.in_proj = ScaledLinear(
-            embed_dim, in_proj_dim, bias=True, initial_scale=query_head_dim**-0.25
-        )
-
-        # [新增] K 的下采样层
-        # 使用 Depth-wise Conv1d 来做可学习的池化
-        if self.pooling_stride > 1:
-            self.k_pool = nn.Conv1d(
-                in_channels=num_heads * key_head_dim,
-                out_channels=num_heads * key_head_dim,
-                kernel_size=pooling_stride,
-                stride=pooling_stride,
-                groups=num_heads * key_head_dim, # Depth-wise
-                bias=False
-            )
-        
-        self.whiten_keys = Whiten(
-            num_groups=num_heads,
-            whitening_limit=_whitening_schedule(3.0),
-            prob=(0.025, 0.25),
-            grad_scale=0.025,
-        )
-
-        self.balance_keys = Balancer(
-            key_head_dim * num_heads,
-            channel_dim=-1,
-            min_positive=0.4,
-            max_positive=0.6,
-            min_abs=0.0,
-            max_abs=100.0,
-            prob=0.025,
-        )
-
-        self.linear_pos = ScaledLinear(
-            pos_dim, num_heads * pos_head_dim, bias=False, initial_scale=0.05
-        )
-
-        self.copy_pos_query = Identity()
-        self.copy_query = Identity()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos_emb: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (seq_len, batch_size, embed_dim)
-            pos_emb: (1, 2*seq_len - 1, pos_dim)
-            key_padding_mask: (batch_size, seq_len)
-        Returns:
-            attn_weights: (num_heads, batch_size, seq_len, seq_len // stride)
-        """
-        x = self.in_proj(x)
-        query_head_dim = self.query_head_dim
-        pos_head_dim = self.pos_head_dim
-        num_heads = self.num_heads
-
-        seq_len, batch_size, _ = x.shape
-        query_dim = query_head_dim * num_heads
-
-        # 切分 Q, K, P
-        q = x[..., 0:query_dim]
-        k = x[..., query_dim : 2 * query_dim]
-        p = x[..., 2 * query_dim :]
-
-        # 对 K 进行下采样，算法的核心部分
-        if self.pooling_stride > 1:
-            # k shape: [seq_len, batch, dim] -> [batch, dim, seq_len] for Conv1d
-            k = k.permute(1, 2, 0)
-            # 处理 padding 确保能整除 stride 
-            if k.size(2) % self.pooling_stride != 0:
-                pad_len = self.pooling_stride - (k.size(2) % self.pooling_stride)
-                k = F.pad(k, (0, pad_len))
-            
-            k = self.k_pool(k) # -> [batch, dim, seq_len/stride]
-            k = k.permute(2, 0, 1) # -> [seq_len/stride, batch, dim]
-
-        # 获取 K 的新长度
-        k_len = k.shape[0] 
-
-        q = self.copy_query(q)
-        k = self.whiten_keys(self.balance_keys(k))
-        p = self.copy_pos_query(p)
-
-        # Reshape
-        q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
-        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
-        k = k.reshape(k_len, batch_size, num_heads, query_head_dim)
-
-        # Permute for matmul
-        q = q.permute(2, 1, 0, 3)  # (head, batch, time_q, d)
-        p = p.permute(2, 1, 0, 3)  # (head, batch, time_q, d_p)
-        k = k.permute(2, 1, 3, 0)  # (head, batch, d, time_k)
-
-        # 计算 QK^T
-        # Shape: (head, batch, seq_len, k_len)
-        attn_scores = torch.matmul(q, k)
-
-        # 处理相对位置编码，适配不对称长度
-        use_pos_scores = False
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            use_pos_scores = True
-        elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
-            use_pos_scores = True
-
-        if use_pos_scores:
-            # 为了简单适配，我们这里借用 streaming_forward 的逻辑
-            # 因为 seq_len 和 k_len 不一样长了，原先的 as_strided 对角线逻辑需要调整
-            # 我们通过调整 pos_emb 的投影来适配
-            
-            # 投影 pos_emb
-            pos_emb_proj = self.linear_pos(pos_emb) # (1, 2*seq_len-1, num_heads*pos_head_dim)
-            
-            # [关键] 简单的近似处理：
-            # 如果 K 被降采样了，相对位置的分辨率也应该降低。
-            # 我们对 pos_emb 进行同样的下采样，或者直接使用类似 streaming 的 logic。
-            # 这里采用最稳健的方法：计算出 P x PosEmb，然后手动 gather 需要的索引。
-            
-            # 注意：PosEmb 通常是针对 Full Resolution 的。
-            # 这里我们使用一种通用的计算方法，不依赖 strict as_strided 对角线
-            
-            # Reshape pos_emb
-            # 我们假设输入的 pos_emb 足够覆盖 range
-            pos_emb_proj = pos_emb_proj.view(1, -1, num_heads, pos_head_dim).permute(2, 0, 3, 1)
-            # (head, 1, pos_head_dim, total_pos_len)
-
-            # 计算 P x PosEmb
-            # (head, batch, time_q, pos_head_dim) x (head, 1, pos_head_dim, total_pos_len)
-            # -> (head, batch, time_q, total_pos_len)
-            raw_pos_scores = torch.matmul(p, pos_emb_proj)
-            
-            # 提取正确的相对位置
-            # 对于 Q 的第 i 行，K 的第 j 列 (对应原位置 j*stride)
-            # 相对距离是 i - (j*stride)
-            # 我们需要构造索引矩阵
-            
-            # 原点偏移量 (通常是 seq_len - 1)
-            center_offset = pos_emb.shape[1] // 2 
-            
-            # 构造 Q 的索引: 0, 1, ..., N-1
-            idx_q = torch.arange(seq_len, device=q.device).unsqueeze(1) # (N, 1)
-            # 构造 K 的索引: 0, s, 2s, ..., (M-1)s
-            idx_k = torch.arange(k_len, device=q.device).unsqueeze(0) * self.pooling_stride # (1, M)
-            
-            # 相对距离矩阵
-            rel_pos = idx_k - idx_q + center_offset # (N, M)
-            
-            # 边界保护
-            rel_pos = rel_pos.clamp(min=0, max=raw_pos_scores.shape[-1] - 1)
-            
-            # Gather: 这一步可能略慢，但逻辑绝对正确且支持任意 stride
-            # raw_pos_scores: (H, B, N, Total_Pos)
-            # 我们需要在最后一个维度取 rel_pos 的值
-            # 扩展索引以匹配 (H, B, N, M)
-            gather_idx = rel_pos.unsqueeze(0).unsqueeze(0).expand(num_heads, batch_size, -1, -1)
-            pos_scores = torch.gather(raw_pos_scores, dim=-1, index=gather_idx)
-
-            attn_scores = attn_scores + pos_scores
-
-        # 5. Mask 处理 (mask 也要下采样)
-        if attn_mask is not None:
-             # attn_mask 应该是 (N, M)
-             # 这里假设外部没有传入，或者传入的是 Full Mask，需要处理
-             pass 
-
-        if key_padding_mask is not None:
-            # key_padding_mask: (batch, seq_len)
-            # 我们需要将其转换为 (batch, k_len)
-            if self.pooling_stride > 1:
-                # 使用切片下采样 mask: [:, ::stride]
-                # 逻辑：如果这个 block 的第一个是 valid，我们就认为 valid，或者反过来
-                # 这里的切片对应着 Conv1d(kernel=s, stride=s) 的对齐位置
-                mask_strided = key_padding_mask[:, ::self.pooling_stride]
-                # 确保长度对齐
-                if mask_strided.shape[1] > k_len:
-                    mask_strided = mask_strided[:, :k_len]
-                elif mask_strided.shape[1] < k_len: # Should not happen with padding
-                    pass
-                key_padding_mask = mask_strided
-                
-            attn_scores = attn_scores.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2), # (B, 1, 1, M)
-                -1000,
-            )
-
-        attn_weights = softmax(attn_scores, dim=-1)
-        
-        # ... dropout ...
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.dropout, training=self.training
-        )
-
-        return attn_weights
-
-
-class SelfAttention_convpool(nn.Module):
-    """
-    支持 KV-Pooling 的 SelfAttention 模块。
-    用于应用权重到 Value 上。
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        value_head_dim: int,
-        pooling_stride: int = 1, # [新增]
-    ) -> None:
-        super().__init__()
-        self.in_proj = nn.Linear(embed_dim, num_heads * value_head_dim, bias=True)
-        self.pooling_stride = pooling_stride # [新增]
-        self.value_head_dim = value_head_dim
-
-        # [新增] V 的下采样层
-        if self.pooling_stride > 1:
-            self.v_pool = nn.Conv1d(
-                in_channels=num_heads * value_head_dim,
-                out_channels=num_heads * value_head_dim,
-                kernel_size=pooling_stride,
-                stride=pooling_stride,
-                groups=num_heads * value_head_dim,
-                bias=False
-            )
-
-        self.out_proj = ScaledLinear(
-            num_heads * value_head_dim, embed_dim, bias=True, initial_scale=0.05
-        )
-
-        self.whiten = Whiten(
-            num_groups=1,
-            whitening_limit=_whitening_schedule(7.5, ratio=3.0),
-            prob=(0.025, 0.25),
-            grad_scale=0.01,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-          x: (seq_len, batch_size, embed_dim)
-          attn_weights: (num_heads, batch_size, seq_len, k_len)
-        """
-        (seq_len, batch_size, embed_dim) = x.shape
-        num_heads = attn_weights.shape[0]
-        
-        # 生成 Value
-        x = self.in_proj(x)  # (seq_len, batch, dim_v)
-        
-        # 对 Value 进行下采样 (必须与 Key 保持一致)
-        if self.pooling_stride > 1:
-            x = x.permute(1, 2, 0) # (B, D, N)
-            if x.size(2) % self.pooling_stride != 0:
-                pad_len = self.pooling_stride - (x.size(2) % self.pooling_stride)
-                x = F.pad(x, (0, pad_len))
-            x = self.v_pool(x) # (B, D, N/s)
-            x = x.permute(2, 0, 1) # (N/s, B, D)
-
-        # Reshape V for matmul
-        # x shape: (k_len, batch, num_heads * value_head_dim)
-        x = x.reshape(-1, batch_size, num_heads, self.value_head_dim).permute(2, 1, 0, 3)
-        # now x (V): (num_heads, batch_size, k_len, value_head_dim)
-        
-        # 验证维度匹配
-        # attn_weights: (H, B, seq_len, k_len)
-        # x (V)       : (H, B, k_len, dim_v)
-        assert attn_weights.shape[-1] == x.shape[-2], \
-            f"Shape mismatch: weights last dim {attn_weights.shape[-1]} != V seq dim {x.shape[-2]}"
-
-        # 加权求和
-        # (H, B, seq_len, k_len) @ (H, B, k_len, dim_v) -> (H, B, seq_len, dim_v)
-        x = torch.matmul(attn_weights, x)
-
-        # 恢复输出
-        x = (
-            x.permute(2, 1, 0, 3)
-            .contiguous()
-            .view(seq_len, batch_size, -1)
-        )
-
-        x = self.out_proj(x)
-        x = self.whiten(x)
-
-        return x
-    
 class FeedforwardModule(nn.Module):
     """Feedforward module in Zipformer2 model."""
 

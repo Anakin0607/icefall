@@ -87,7 +87,7 @@ from torch import Tensor
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from zipformer import Zipformer2
+from zipformer.zipformer_kvpooling import Zipformer2
 
 from icefall import diagnostics
 from icefall.char_graph_compiler import CharCtcTrainingGraphCompiler
