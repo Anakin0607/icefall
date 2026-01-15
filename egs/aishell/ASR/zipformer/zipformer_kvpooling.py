@@ -711,45 +711,44 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self.const_attention_rate = copy.deepcopy(const_attention_rate)
 
-        if pooling_mode == "conv":
-            self.self_attn_weights = RelPositionMultiheadAttentionWeights_convpool(
-                embed_dim,
-                pos_dim=pos_dim,
-                num_heads=num_heads,
-                query_head_dim=query_head_dim,
-                pos_head_dim=pos_head_dim,
-                dropout=0.0,
-                pooling_stride=pooling_stride,
-            )
-        elif pooling_mode == "avg":
-            self.self_attn_weights = RelPositionMultiheadAttentionWeights_avgpool(
-                embed_dim,
-                pos_dim=pos_dim,
-                num_heads=num_heads,
-                query_head_dim=query_head_dim,
-                pos_head_dim=pos_head_dim,
-                dropout=0.0,
-                pooling_stride=pooling_stride,
-            )
-        else:
+        if pooling_mode == "none":
             self.self_attn_weights = RelPositionMultiheadAttentionWeights(
-                embed_dim,
-                pos_dim=pos_dim,
-                num_heads=num_heads,
-                query_head_dim=query_head_dim,
-                pos_head_dim=pos_head_dim,
-                dropout=0.0,
-            )
-
-        if pooling_mode == "conv":
-            self.self_attn1 = SelfAttention_convpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-            self.self_attn2 = SelfAttention_convpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-        elif pooling_mode == "avg":
-            self.self_attn1 = SelfAttention_avgpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-            self.self_attn2 = SelfAttention_avgpool(embed_dim, num_heads, value_head_dim, pooling_stride=pooling_stride)
-        else:
+                    embed_dim,
+                    pos_dim=pos_dim,
+                    num_heads=num_heads,
+                    query_head_dim=query_head_dim,
+                    pos_head_dim=pos_head_dim,
+                    dropout=0.0,
+                )
             self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim)
             self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim)
+
+        else:
+            self.self_attn_weights = RelPositionMultiheadAttentionWeights_pooling(
+                embed_dim,
+                pos_dim=pos_dim,
+                num_heads=num_heads,
+                query_head_dim=query_head_dim,
+                pos_head_dim=pos_head_dim,
+                dropout=0.0,
+                pooling_stride=pooling_stride,
+                pooling_mode=pooling_mode,
+            )
+
+            self.self_attn1 = SelfAttention_pooling(
+                embed_dim, 
+                num_heads, 
+                value_head_dim, 
+                pooling_stride=pooling_stride,
+                pooling_mode=pooling_mode)
+            
+            self.self_attn2 = SelfAttention_pooling(
+                embed_dim, 
+                num_heads, 
+                value_head_dim, 
+                pooling_stride=pooling_stride,
+                pooling_mode=pooling_mode)
+            
 
         self.feed_forward1 = FeedforwardModule(
             embed_dim, (feedforward_dim * 3) // 4, dropout
@@ -760,13 +759,17 @@ class Zipformer2EncoderLayer(nn.Module):
         self.feed_forward3 = FeedforwardModule(
             embed_dim, (feedforward_dim * 5) // 4, dropout
         )
-        if pooling_mode == "conv":
-            self.nonlin_attention = NonlinAttention_convpool(
-                embed_dim, hidden_channels=3 * embed_dim // 4, pooling_stride=pooling_stride
-            )
-        else:
+
+        if pooling_mode == "none":
             self.nonlin_attention = NonlinAttention(
                 embed_dim, hidden_channels=3 * embed_dim // 4
+            )
+        else:
+            self.nonlin_attention = NonlinAttention_pooling(
+                embed_dim, 
+                hidden_channels=3 * embed_dim // 4, 
+                pooling_stride=pooling_stride,
+                pooling_mode=pooling_mode,
             )
 
         self.conv_module1 = ConvolutionModule(
@@ -2432,7 +2435,7 @@ class SelfAttention_avgpool(nn.Module):
 
         return x
 
-class RelPositionMultiheadAttentionWeights_convpool(nn.Module):
+class RelPositionMultiheadAttentionWeights_pooling(nn.Module):
     """
     支持 KV-Pooling (Strided) 的相对位置多头注意力权重计算模块。
     """
@@ -2694,7 +2697,7 @@ class RelPositionMultiheadAttentionWeights_convpool(nn.Module):
         return attn_weights
 
 
-class SelfAttention_convpool(nn.Module):
+class SelfAttention_pooling(nn.Module):
     """
     支持 KV-Pooling 的 SelfAttention 模块。
     用于应用权重到 Value 上。
@@ -2706,6 +2709,7 @@ class SelfAttention_convpool(nn.Module):
         num_heads: int,
         value_head_dim: int,
         pooling_stride: int = 1, 
+        pooling_mode: str = "none",
     ) -> None:
         super().__init__()
         self.in_proj = nn.Linear(embed_dim, num_heads * value_head_dim, bias=True)
@@ -2714,14 +2718,22 @@ class SelfAttention_convpool(nn.Module):
 
         # Pooling layer for V
         if self.pooling_stride > 1:
-            self.v_pool = nn.Conv1d(
-                in_channels=num_heads * value_head_dim,
-                out_channels=num_heads * value_head_dim,
-                kernel_size=pooling_stride,
-                stride=pooling_stride,
-                groups=num_heads * value_head_dim,
-                bias=False
-            )
+            if pooling_mode == "conv":
+                self.v_pool = nn.Conv1d(
+                    in_channels=num_heads * value_head_dim,
+                    out_channels=num_heads * value_head_dim,
+                    kernel_size=pooling_stride,
+                    stride=pooling_stride,
+                    groups=num_heads * value_head_dim,
+                    bias=False
+                )
+            else:
+                self.v_pool = nn.AvgPool1d(
+                    kernel_size=pooling_stride,
+                    stride=pooling_stride,
+                    padding=0,
+                    ceil_mode=False
+                )
 
         self.out_proj = ScaledLinear(
             num_heads * value_head_dim, embed_dim, bias=True, initial_scale=0.05
@@ -2756,6 +2768,7 @@ class SelfAttention_convpool(nn.Module):
             if x.size(2) % self.pooling_stride != 0:
                 pad_len = self.pooling_stride - (x.size(2) % self.pooling_stride)
                 x = F.pad(x, (0, pad_len))
+
             x = self.v_pool(x) # (B, D, N/s)
             x = x.permute(2, 0, 1) # (N/s, B, D)
 
@@ -2996,7 +3009,7 @@ class NonlinAttention(nn.Module):
         x = self.out_proj(x)
         return x, cached_x
 
-class NonlinAttention_convpool(nn.Module):
+class NonlinAttention_pooling(nn.Module):
     """
     Args:
         channels (int): The number of channels of conv layers.
@@ -3007,12 +3020,13 @@ class NonlinAttention_convpool(nn.Module):
         self,
         channels: int,
         hidden_channels: int,
-        pooling_stride: int = 1, # [修改 1] 新增参数
+        pooling_stride: int = 1,
+        pooling_mode: str = "none",
     ) -> None:
         super().__init__()
 
         self.hidden_channels = hidden_channels
-        self.pooling_stride = pooling_stride # [修改 2] 记录步长
+        self.pooling_stride = pooling_stride # 记录pooling步长
 
         self.in_proj = nn.Linear(channels, hidden_channels * 3, bias=True)
 
@@ -3048,17 +3062,25 @@ class NonlinAttention_convpool(nn.Module):
             grad_scale=0.01,
         )
         
-        # [修改 3] 定义 Pooling 层 (步长卷积)
-        # 使用 groups=hidden_channels 进行深度卷积，相当于对每个特征维度独立做带权重的池化
+        # 定义 Pooling 层 
+        
         if self.pooling_stride > 1:
-            self.value_pooling = nn.Conv1d(
-                in_channels=hidden_channels,
-                out_channels=hidden_channels,
-                kernel_size=pooling_stride, # 卷积核大小通常等于步长
-                stride=pooling_stride,
-                groups=hidden_channels,     # Depthwise conv
-                bias=False                  # 池化通常不需要 bias
-            )
+            if pooling_mode == "conv":
+                self.value_pooling = nn.Conv1d(
+                    in_channels=hidden_channels,
+                    out_channels=hidden_channels,
+                    kernel_size=pooling_stride, # 卷积核大小通常等于步长
+                    stride=pooling_stride,
+                    groups=hidden_channels,     # Depthwise conv
+                    bias=False                  # 池化通常不需要 bias
+                )
+            else:
+                self.value_pooling = nn.AvgPool1d(
+                    kernel_size=pooling_stride,
+                    stride=pooling_stride,
+                    padding=0,
+                    ceil_mode=False
+                )
 
     def forward(
         self,
