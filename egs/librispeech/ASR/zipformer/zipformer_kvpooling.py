@@ -1,0 +1,1 @@
+../../../aishell/ASR/zipformer/zipformer_kvpooling.py

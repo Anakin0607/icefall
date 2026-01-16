@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES="6,7"
+export CUDA_VISIBLE_DEVICES="0,1"
 
 ./pruned_transducer_stateless3/train.py \
     --world-size 2 \

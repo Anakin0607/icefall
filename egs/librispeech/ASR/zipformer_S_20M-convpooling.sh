@@ -4,6 +4,7 @@ export CUDA_VISIBLE_DEVICES="6,7"
   --world-size 2 \
   --num-epochs 20 \
   --start-epoch 1 \
+  --bpe-model data/lang_bpe_5000/bpe.model \
   --exp-dir zipformer/exp-S-20M-convpooling \
   --use-fp16 1 \
   --num-encoder-layers "2,2,3,2,2" \
@@ -16,4 +17,5 @@ export CUDA_VISIBLE_DEVICES="6,7"
   --pooling-mode "conv" \
   --pooling-stride "4,2,1,1,1" \
   --lr-epochs 1.5 \
-  --max-duration 500
+  --master-port 12357 \
+  --max-duration 500 # total audio length in one batch

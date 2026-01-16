@@ -1,7 +1,7 @@
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="0,1"
 
 ./pruned_transducer_stateless5/train.py \
-    --world-size 4 \
+    --world-size 2 \
     --num-epochs 30 \
     --start-epoch 1 \
     --exp-dir pruned_transducer_stateless5/exp-M-40M \
@@ -12,4 +12,4 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
     --encoder-dim 320 \
     --max-duration 300 \
     --master-port 12300 \
-    --start-batch 432000
+    --start-batch 1416000
